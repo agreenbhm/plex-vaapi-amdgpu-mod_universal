@@ -3,8 +3,8 @@ set -euo pipefail
 
 # ============================================================
 # Plex AMD VAAPI host installer
-# Mirrors the original docker-mod approach by extracting
-# MUSL-built Mesa/libva/libdrm userspace from Alpine edge.
+# Replaces Plex-bundled userspace libraries with Alpine edge
+# MUSL Mesa/libva/libdrm components (no separate runtime dir).
 # ============================================================
 
 PLEX_DIR="/usr/lib/plexmediaserver"
@@ -15,16 +15,12 @@ PLEX_VA_CACHE="$PLEX_CACHE_DIR/va-dri-linux-x86_64"
 MESA_SHADER_CACHE_DIR="$PLEX_CACHE_DIR/mesa-shader-cache"
 SERVICE_NAME="plexmediaserver"
 
-BUNDLE_ROOT="/opt/plex-amd-vaapi"
-BUNDLE_DIR="$BUNDLE_ROOT/vaapi-amdgpu"
-BUNDLE_AMDGPU_IDS="$BUNDLE_ROOT/usr/share/libdrm/amdgpu.ids"
-
 ALPINE_IMAGE="alpine:edge"
 RUNTIME=""
 
 DRY_RUN=0
 NO_RESTART=0
-SKIP_BUNDLE_REFRESH=0
+KEEP_TEMP=0
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -35,12 +31,11 @@ usage() {
 Usage: sudo ./install-plex-amd-vaapi.sh [options]
 
 Options:
-  --dry-run              Print actions only
-  --no-restart           Do not restart plexmediaserver
-  --skip-bundle-refresh  Reuse existing Alpine-extracted bundle
-  --bundle-root PATH     Install extracted files under PATH (default: /opt/plex-amd-vaapi)
-  --alpine-image IMAGE   Alpine source image (default: alpine:edge)
-  -h, --help             Show this help
+  --dry-run            Print actions only
+  --no-restart         Do not restart plexmediaserver
+  --alpine-image IMG   Override source image (default: alpine:edge)
+  --keep-temp          Keep temporary extraction directory
+  -h, --help           Show this help
 USAGE
 }
 
@@ -61,20 +56,13 @@ parse_args() {
       --no-restart)
         NO_RESTART=1
         ;;
-      --skip-bundle-refresh)
-        SKIP_BUNDLE_REFRESH=1
-        ;;
-      --bundle-root)
-        shift
-        [[ $# -eq 0 ]] && { err "--bundle-root requires a path"; exit 1; }
-        BUNDLE_ROOT="$1"
-        BUNDLE_DIR="$BUNDLE_ROOT/vaapi-amdgpu"
-        BUNDLE_AMDGPU_IDS="$BUNDLE_ROOT/usr/share/libdrm/amdgpu.ids"
-        ;;
       --alpine-image)
         shift
         [[ $# -eq 0 ]] && { err "--alpine-image requires an image"; exit 1; }
         ALPINE_IMAGE="$1"
+        ;;
+      --keep-temp)
+        KEEP_TEMP=1
         ;;
       -h|--help)
         usage
@@ -107,6 +95,11 @@ check_plex_paths() {
     err "Expected Plex binaries not found under: $PLEX_DIR"
     exit 1
   fi
+
+  if [[ ! -d "$PLEX_LIB_DIR" ]]; then
+    err "Plex library directory not found: $PLEX_LIB_DIR"
+    exit 1
+  fi
 }
 
 detect_runtime() {
@@ -114,28 +107,23 @@ detect_runtime() {
     RUNTIME="docker"
     return
   fi
-
   if command -v podman >/dev/null 2>&1; then
     RUNTIME="podman"
     return
   fi
 
-  err "Neither docker nor podman is installed. One is required to extract Alpine MUSL VAAPI libraries."
+  err "Neither docker nor podman is installed. One is required to extract Alpine MUSL libraries."
   exit 1
 }
 
-extract_alpine_bundle() {
-  if [[ "$SKIP_BUNDLE_REFRESH" -eq 1 ]]; then
-    log "Skipping Alpine bundle refresh (--skip-bundle-refresh)."
-    return
-  fi
+extract_alpine_payload() {
+  local temp_dir="$1"
 
   detect_runtime
   log "Using container runtime: $RUNTIME"
-  log "Pulling Alpine source image: $ALPINE_IMAGE"
+  log "Pulling source image: $ALPINE_IMAGE"
   run "$RUNTIME pull \"$ALPINE_IMAGE\""
 
-  local cid=""
   local build_cmd
   build_cmd='set -e
 apk add --no-cache mesa-va-gallium libva pax-utils libdrm >/dev/null
@@ -148,31 +136,76 @@ for f in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do [ -f "\$f" ] && cp -nL "\
 [ -f /usr/share/libdrm/amdgpu.ids ] && cp /usr/share/libdrm/amdgpu.ids /source/usr/share/libdrm/ || true'
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '[DRY-RUN] %s create "%s" sh -lc "...extract bundle..."\n' "$RUNTIME" "$ALPINE_IMAGE"
+    printf '[DRY-RUN] %s create "%s" sh -lc "...extract payload..."\n' "$RUNTIME" "$ALPINE_IMAGE"
     return
   fi
 
+  local cid
   cid=$($RUNTIME create "$ALPINE_IMAGE" sh -lc "$build_cmd")
   trap '$RUNTIME rm -f "$cid" >/dev/null 2>&1 || true' RETURN
 
   $RUNTIME start -a "$cid" >/dev/null
-  rm -rf "$BUNDLE_ROOT"
-  mkdir -p "$BUNDLE_ROOT"
-  $RUNTIME cp "$cid:/source/." "$BUNDLE_ROOT/"
+  mkdir -p "$temp_dir"
+  $RUNTIME cp "$cid:/source/." "$temp_dir/"
   $RUNTIME rm -f "$cid" >/dev/null 2>&1 || true
   trap - RETURN
 
-  if [[ ! -f "$BUNDLE_DIR/lib/dri/radeonsi_drv_video.so" ]]; then
-    err "Extraction failed: missing $BUNDLE_DIR/lib/dri/radeonsi_drv_video.so"
+  if [[ ! -f "$temp_dir/vaapi-amdgpu/lib/dri/radeonsi_drv_video.so" ]]; then
+    err "Extraction failed: missing radeonsi_drv_video.so"
     exit 1
   fi
+}
 
-  log "Extracted Alpine MUSL VAAPI bundle to: $BUNDLE_ROOT"
+backup_then_copy() {
+  local src="$1"
+  local dst="$2"
+
+  if [[ -e "$dst" && ! -e "$dst.orig-amdvaapi" ]]; then
+    run "cp -a \"$dst\" \"$dst.orig-amdvaapi\""
+    log "Backed up: $dst -> $dst.orig-amdvaapi"
+  fi
+
+  run "cp -a \"$src\" \"$dst\""
+}
+
+overwrite_plex_libraries() {
+  local temp_dir="$1"
+  local payload_lib="$temp_dir/vaapi-amdgpu/lib"
+
+  log "Overwriting Plex libraries with Alpine MUSL versions..."
+
+  local src
+  for src in "$payload_lib"/*.so*; do
+    [[ -f "$src" ]] || continue
+    backup_then_copy "$src" "$PLEX_LIB_DIR/$(basename "$src")"
+  done
+
+  run "mkdir -p \"$PLEX_LIB_DIR/dri\""
+  for src in "$payload_lib"/dri/*.so; do
+    [[ -f "$src" ]] || continue
+    backup_then_copy "$src" "$PLEX_LIB_DIR/dri/$(basename "$src")"
+  done
+}
+
+install_amdgpu_ids() {
+  local temp_dir="$1"
+  local src_ids="$temp_dir/usr/share/libdrm/amdgpu.ids"
+  local dst_ids="/usr/share/libdrm/amdgpu.ids"
+
+  if [[ ! -f "$src_ids" ]]; then
+    warn "Extracted amdgpu.ids not found; skipping amdgpu.ids replacement."
+    return
+  fi
+
+  run "mkdir -p /usr/share/libdrm"
+  backup_then_copy "$src_ids" "$dst_ids"
 }
 
 link_hardcoded_amdgpu_ids() {
-  if [[ ! -f "$BUNDLE_AMDGPU_IDS" ]]; then
-    warn "amdgpu.ids missing from extracted bundle at $BUNDLE_AMDGPU_IDS"
+  local ids_file="/usr/share/libdrm/amdgpu.ids"
+
+  if [[ ! -f "$ids_file" ]]; then
+    warn "No amdgpu.ids available at $ids_file"
     return
   fi
 
@@ -181,7 +214,7 @@ link_hardcoded_amdgpu_ids() {
   found=$(grep -r -h -o -a '/home/runner[^"[:space:]]*amdgpu\.ids' "$PLEX_LIB_DIR" 2>/dev/null | sort -u || true)
 
   if [[ -z "$found" ]]; then
-    log "No hardcoded amdgpu.ids paths found (cosmetic unknown-GPU naming may remain)."
+    log "No hardcoded amdgpu.ids paths found."
     return
   fi
 
@@ -189,68 +222,20 @@ link_hardcoded_amdgpu_ids() {
     [[ -z "$ids_path" ]] && continue
     log "Found hardcoded path: $ids_path"
     run "mkdir -p \"$(dirname "$ids_path")\""
-    run "ln -sf \"$BUNDLE_AMDGPU_IDS\" \"$ids_path\""
+    run "ln -sf \"$ids_file\" \"$ids_path\""
   done <<< "$found"
 }
 
-write_wrapper() {
-  local target="$1"
-  local orig="$2"
-  local exec_orig="$3"
-
-  if [[ ! -f "$orig" ]]; then
-    log "Backing up original binary: $target -> $orig"
-    run "mv \"$target\" \"$orig\""
-  else
-    log "Wrapper already exists for: $target"
-  fi
-
-  local tmp_wrapper
-  tmp_wrapper=$(mktemp)
-  cat > "$tmp_wrapper" << WRAPPER
-#!/usr/bin/env bash
-set -euo pipefail
-
-export LD_LIBRARY_PATH="$BUNDLE_DIR/lib:\${LD_LIBRARY_PATH:-}"
-export LIBVA_DRIVERS_PATH="$BUNDLE_DIR/lib/dri"
-export LIBVA_DRIVER_NAME="radeonsi"
-export MESA_SHADER_CACHE_DIR="$MESA_SHADER_CACHE_DIR"
-mkdir -p "\$MESA_SHADER_CACHE_DIR" 2>/dev/null || true
-
-exec "$exec_orig" "\$@"
-WRAPPER
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '[DRY-RUN] install wrapper at %s\n' "$target"
-    rm -f "$tmp_wrapper"
-  else
-    install -m 0755 "$tmp_wrapper" "$target"
-    rm -f "$tmp_wrapper"
-  fi
-}
-
-setup_wrappers() {
-  log "Creating Plex wrappers to force Alpine MUSL VAAPI stack..."
-  write_wrapper "$PLEX_DIR/Plex Transcoder" "$PLEX_DIR/Plex Transcoder.orig" "$PLEX_DIR/Plex Transcoder.orig"
-  write_wrapper "$PLEX_DIR/Plex Media Server" "$PLEX_DIR/Plex Media Server.orig" "$PLEX_DIR/Plex Media Server.orig"
-}
-
-setup_va_cache() {
-  local driver="$BUNDLE_DIR/lib/dri/radeonsi_drv_video.so"
-
-  if [[ ! -f "$driver" ]]; then
-    err "Missing driver in bundle: $driver"
-    exit 1
-  fi
-
+setup_plex_va_cache() {
+  log "Linking Plex VA cache to Plex-installed DRI drivers..."
   run "mkdir -p \"$PLEX_VA_CACHE\" \"$MESA_SHADER_CACHE_DIR\""
   run "rm -f \"$PLEX_VA_CACHE\"/*.so* 2>/dev/null || true"
 
-  local so
-  for so in "$BUNDLE_DIR"/lib/dri/*.so; do
-    [[ -f "$so" ]] || continue
-    run "ln -sf \"$so\" \"$PLEX_VA_CACHE/$(basename "$so")\""
-    log "Linked driver: $(basename "$so")"
+  local driver
+  for driver in "$PLEX_LIB_DIR"/dri/*.so; do
+    [[ -f "$driver" ]] || continue
+    run "ln -sf \"$driver\" \"$PLEX_VA_CACHE/$(basename "$driver")\""
+    log "Linked driver: $(basename "$driver")"
   done
 }
 
@@ -279,15 +264,14 @@ print_next_steps() {
 Installation complete.
 
 Recommended checks:
-  1. Validate extracted runtime exists:
-       ls "$BUNDLE_DIR/lib" | head
-  2. Verify Plex wrappers are scripts:
-       head -n 8 "$PLEX_DIR/Plex Transcoder"
-       head -n 8 "$PLEX_DIR/Plex Media Server"
-  3. Start a Plex transcode and inspect logs for:
+  1. Verify Alpine libs are in Plex lib dir:
+       ls "$PLEX_LIB_DIR"/libva*.so* 2>/dev/null || true
+       ls "$PLEX_LIB_DIR/dri" | head
+  2. Start a Plex transcode and inspect logs for:
        final decoder: vaapi, final encoder: vaapi
 
-If Plex updates overwrite wrappers, rerun this installer.
+If Plex updates replace libraries, rerun this installer.
+Backups are kept as *.orig-amdvaapi files.
 OUT
 }
 
@@ -295,10 +279,21 @@ main() {
   parse_args "$@"
   require_root
   check_plex_paths
-  extract_alpine_bundle
+
+  local temp_dir
+  temp_dir=$(mktemp -d)
+
+  if [[ "$KEEP_TEMP" -eq 0 ]]; then
+    trap 'rm -rf "$temp_dir"' EXIT
+  else
+    log "Keeping temporary directory: $temp_dir"
+  fi
+
+  extract_alpine_payload "$temp_dir"
+  overwrite_plex_libraries "$temp_dir"
+  install_amdgpu_ids "$temp_dir"
   link_hardcoded_amdgpu_ids
-  setup_wrappers
-  setup_va_cache
+  setup_plex_va_cache
   restart_plex
   print_next_steps
 }

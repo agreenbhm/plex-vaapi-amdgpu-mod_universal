@@ -1,35 +1,41 @@
-# Plex AMD VAAPI Host Installer (Alpine MUSL bundle)
+# Plex AMD VAAPI Host Installer (in-place Plex library replacement)
 
-This repository provides a **host-side installer** for Plex Media Server on Linux VMs/LXC/bare metal.
+This repository provides a host-side installer that **replaces Plex-used libraries in place** with Alpine edge MUSL VAAPI components.
 
-It is specifically designed to mimic the original Docker-mod behavior by extracting **MUSL-built** userspace VAAPI libraries from Alpine edge and injecting them into Plex runtime startup.
+Instead of maintaining a separate runtime folder and redirecting Plex with custom library paths, this approach installs Alpine userspace files directly into Plex's own library locations.
 
-## Why this approach
+## What this installer does
 
-Plex bundles MUSL-linked components and has hardcoded expectations around its GPU userspace stack. In some environments, using distro-native glibc Mesa/libva packages alone is not sufficient for newer AMD GPUs.
+`install-plex-amd-vaapi.sh` now performs these steps:
 
-So this installer follows the same functional strategy as the original mod:
+1. Pulls an Alpine image (`alpine:edge` by default) using `docker` or `podman`.
+2. Extracts MUSL VAAPI stack components similar to the original Docker mod build process:
+   - `radeonsi_drv_video.so`
+   - `libva*.so*`
+   - transitive library dependencies
+   - musl loader / musl libc
+   - `amdgpu.ids`
+3. Overwrites matching files in Plex library directories:
+   - `/usr/lib/plexmediaserver/lib`
+   - `/usr/lib/plexmediaserver/lib/dri`
+4. Replaces `/usr/share/libdrm/amdgpu.ids` with the Alpine version.
+5. Scans Plex libraries for hardcoded `amdgpu.ids` paths and symlinks them.
+6. Rebuilds Plex VA cache symlinks and optionally restarts `plexmediaserver`.
 
-1. Acquire modern `mesa-va-gallium`, `libva`, and `libdrm` from **Alpine edge**.
-2. Copy required libraries, dependencies, and `amdgpu.ids` into a local bundle.
-3. Wrap `Plex Media Server` and `Plex Transcoder` to force that bundle via `LD_LIBRARY_PATH` and `LIBVA_*`.
-4. Symlink VA drivers into Plex VA cache.
-5. Symlink hardcoded `amdgpu.ids` paths found in Plex binaries.
+## Safety / backups
 
-## What gets installed
+Before replacing any existing target file, the installer creates a one-time backup:
 
-By default, extracted files are installed under:
+- `<target>.orig-amdvaapi`
 
-- `/opt/plex-amd-vaapi/vaapi-amdgpu/lib`
-- `/opt/plex-amd-vaapi/vaapi-amdgpu/lib/dri`
-- `/opt/plex-amd-vaapi/usr/share/libdrm/amdgpu.ids`
+These backups are retained so you can manually restore files if needed.
 
 ## Requirements
 
 - Plex installed at `/usr/lib/plexmediaserver`
 - Root access
-- `docker` or `podman` installed (used to extract Alpine files)
-- AMD GPU available to host/LXC (`/dev/dri`)
+- `docker` or `podman`
+- AMD GPU exposed to host/LXC (`/dev/dri`)
 
 ## Install
 
@@ -41,37 +47,30 @@ sudo ./install-plex-amd-vaapi.sh
 ## Options
 
 ```text
---dry-run               Print actions only
---no-restart            Do not restart plexmediaserver
---skip-bundle-refresh   Reuse existing extracted bundle
---bundle-root PATH      Override bundle root (default /opt/plex-amd-vaapi)
---alpine-image IMAGE    Override Alpine image (default alpine:edge)
+--dry-run            Print actions only
+--no-restart         Do not restart plexmediaserver
+--alpine-image IMG   Override source image (default: alpine:edge)
+--keep-temp          Keep temporary extraction directory
 ```
 
 ## Verify
 
-1. Confirm bundle exists:
+1. Confirm libraries/drivers are present in Plex directories:
 
 ```bash
-ls /opt/plex-amd-vaapi/vaapi-amdgpu/lib | head
+ls /usr/lib/plexmediaserver/lib/libva*.so*
+ls /usr/lib/plexmediaserver/lib/dri | head
 ```
 
-2. Confirm wrappers were installed:
-
-```bash
-head -n 12 /usr/lib/plexmediaserver/Plex\ Transcoder
-head -n 12 /usr/lib/plexmediaserver/Plex\ Media\ Server
-```
-
-3. Run a transcode and inspect Plex logs for:
+2. Start a transcode and inspect Plex logs for:
 
 ```text
 final decoder: vaapi, final encoder: vaapi
 ```
 
-4. In Plex dashboard, active transcodes should show `(hw)`.
+3. In Plex dashboard, active transcodes should show `(hw)`.
 
-## Re-run behavior
+## Notes
 
-- If Plex updates overwrite `Plex Media Server` / `Plex Transcoder`, rerun installer.
-- If you want fresh Alpine edge libraries, rerun without `--skip-bundle-refresh`.
+- If Plex updates overwrite bundled libraries, rerun the installer.
+- This intentionally mirrors the original Alpine MUSL extraction strategy while targeting non-Docker Plex installs.
