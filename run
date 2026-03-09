@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
+SCRIPT_PATH="$(dirname $(realpath $0))"
+
 if [ -f .env ]; then
-	source .env
+	source "$SCRIPT_PATH/.env"
 fi
 
 if [ -z "$PLEX_APPLICATION_SUPPORT_DIR" ]; then
@@ -9,7 +11,7 @@ if [ -z "$PLEX_APPLICATION_SUPPORT_DIR" ]; then
 fi
 
 echo "**** Building Alpine container with MUSL dependencies ****"
-podman build -t agreenbhm/alpine_amd:latest .
+podman build -t agreenbhm/alpine_amd:latest -f "$SCRIPT_PATH/Dockerfile"
 echo
 echo "**** Copying AMD VAAPI drivers and MUSL dependencies from Alpine image to host ****"
 podman run --rm -v /:/host agreenbhm/alpine_amd:latest sh -c 'cp -R /source/* /host/'
@@ -97,6 +99,10 @@ if [ ! -f "$PLEX_SERVER_ORIG" ]; then
     
     cat > "$PLEX_SERVER" << 'EOF'
 #!/bin/bash
+
+# Re-run Radeon driver fix on each launch
+__REPLACE_WITH_SCRIPT__
+
 # AMD VAAPI wrapper for main Plex process
 export LD_LIBRARY_PATH="/vaapi-amdgpu/lib:${LD_LIBRARY_PATH}"
 export LIBVA_DRIVERS_PATH="/vaapi-amdgpu/lib/dri"
@@ -138,5 +144,11 @@ done
 if [ -f "$OUR_AMDGPU_IDS" ]; then
     echo "amdgpu.ids present at $OUR_AMDGPU_IDS"
 fi
+
+#
+# Step 5: Make script auto-run on Plex start
+#
+
+sed -i "s|__REPLACE_WITH_SCRIPT__|$SCRIPT_PATH/run|g" "/usr/lib/plexmediaserver/Plex Media Server"
 
 echo "**** AMD VAAPI setup complete ****"
