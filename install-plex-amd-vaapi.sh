@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 # ============================================================
 # Plex AMD VAAPI host installer
@@ -16,6 +16,7 @@ PLEX_VA_CACHE=""
 MESA_SHADER_CACHE_DIR=""
 PLEX_DRIVERS_ROOT=""
 SERVICE_NAME="plexmediaserver"
+SYSTEMD_UNIT=""
 
 ALPINE_IMAGE="alpine:edge"
 RUNTIME=""
@@ -37,7 +38,7 @@ Options:
   --dry-run               Print actions only
   --no-restart            Do not restart plexmediaserver
   --alpine-image IMG      Override source image (default: alpine:edge)
-  --service-name NAME     Override systemd unit name (default: plexmediaserver)
+  --service-name NAME     Override systemd unit name (default: plexmediaserver, with/without .service)
   --plex-data-dir PATH    Override Plex app-support path (root or full ".../Plex Media Server")
   --keep-temp             Keep temporary extraction directory
   -h, --help              Show this help
@@ -101,6 +102,23 @@ require_root() {
   fi
 }
 
+resolve_systemd_unit_name() {
+  # Accept both "plexmediaserver" and "plexmediaserver.service".
+  if [[ "$SERVICE_NAME" == *.service ]]; then
+    SYSTEMD_UNIT="$SERVICE_NAME"
+  else
+    SYSTEMD_UNIT="$SERVICE_NAME.service"
+  fi
+}
+
+systemd_unit_exists() {
+  # Use LoadState from systemctl show instead of list-unit-files matching,
+  # which can be unreliable across distros/packaging styles.
+  local state
+  state=$(systemctl show "$SYSTEMD_UNIT" --property=LoadState --value 2>/dev/null || true)
+  [[ -n "$state" && "$state" != "not-found" ]]
+}
+
 normalize_plex_paths() {
   # Accept either app-support root or full ".../Plex Media Server" path.
   if [[ "$PLEX_APP_SUPPORT_DIR" == */"Plex Media Server" ]]; then
@@ -130,7 +148,7 @@ resolve_plex_data_dir_from_systemd() {
   fi
 
   local unit_env
-  unit_env=$(systemctl show "$SERVICE_NAME" --property=Environment --value 2>/dev/null || true)
+  unit_env=$(systemctl show "$SYSTEMD_UNIT" --property=Environment --value 2>/dev/null || true)
   if [[ -n "$unit_env" ]]; then
     # Environment output can contain shell-quoted assignments when values
     # include spaces, e.g.:
@@ -154,7 +172,7 @@ PY
   fi
 
   local env_files
-  env_files=$(systemctl show "$SERVICE_NAME" --property=EnvironmentFiles --value 2>/dev/null || true)
+  env_files=$(systemctl show "$SYSTEMD_UNIT" --property=EnvironmentFiles --value 2>/dev/null || true)
   if [[ -n "$env_files" ]]; then
     local env_file
     while IFS= read -r env_file; do
@@ -377,11 +395,11 @@ restart_plex() {
     return
   fi
 
-  if systemctl list-unit-files | grep -q "^$SERVICE_NAME\\.service"; then
-    log "Restarting $SERVICE_NAME service..."
-    run "systemctl restart $SERVICE_NAME"
+  if systemd_unit_exists; then
+    log "Restarting $SYSTEMD_UNIT service..."
+    run "systemctl restart $SYSTEMD_UNIT"
   else
-    warn "Service $SERVICE_NAME not found. Restart Plex manually."
+    warn "Service $SYSTEMD_UNIT not found. Restart Plex manually."
   fi
 }
 
@@ -412,6 +430,7 @@ OUT
 main() {
   parse_args "$@"
   require_root
+  resolve_systemd_unit_name
   resolve_plex_data_dir_from_systemd
   check_plex_paths
 

@@ -48,7 +48,7 @@ sudo ./install-plex-amd-vaapi.sh
 --dry-run               Print actions only
 --no-restart            Do not restart plexmediaserver
 --alpine-image IMG      Override source image (default: alpine:edge)
---service-name NAME     Override systemd unit name (default: plexmediaserver)
+--service-name NAME     Override systemd unit name (default: plexmediaserver, with/without .service)
 --plex-data-dir PATH    Override Plex app-support path (root or full ".../Plex Media Server")
 --keep-temp             Keep temporary extraction directory
 ```
