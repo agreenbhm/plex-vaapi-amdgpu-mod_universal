@@ -10,9 +10,10 @@ set -euo pipefail
 PLEX_DIR="/usr/lib/plexmediaserver"
 PLEX_LIB_DIR="$PLEX_DIR/lib"
 PLEX_DATA_DIR="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server"
-PLEX_CACHE_DIR="$PLEX_DATA_DIR/Cache"
-PLEX_VA_CACHE="$PLEX_CACHE_DIR/va-dri-linux-x86_64"
-MESA_SHADER_CACHE_DIR="$PLEX_CACHE_DIR/mesa-shader-cache"
+PLEX_CACHE_DIR=""
+PLEX_VA_CACHE=""
+MESA_SHADER_CACHE_DIR=""
+PLEX_DRIVERS_ROOT=""
 SERVICE_NAME="plexmediaserver"
 
 ALPINE_IMAGE="alpine:edge"
@@ -21,6 +22,7 @@ RUNTIME=""
 DRY_RUN=0
 NO_RESTART=0
 KEEP_TEMP=0
+ENV_ONLY=0
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -31,11 +33,13 @@ usage() {
 Usage: sudo ./install-plex-amd-vaapi.sh [options]
 
 Options:
-  --dry-run            Print actions only
-  --no-restart         Do not restart plexmediaserver
-  --alpine-image IMG   Override source image (default: alpine:edge)
-  --keep-temp          Keep temporary extraction directory
-  -h, --help           Show this help
+  --dry-run               Print actions only
+  --no-restart            Do not restart plexmediaserver
+  --alpine-image IMG      Override source image (default: alpine:edge)
+  --service-name NAME     Override systemd unit name (default: plexmediaserver)
+  --plex-data-dir PATH    Override Plex app support dir (skip systemd env detection)
+  --keep-temp             Keep temporary extraction directory
+  -h, --help              Show this help
 USAGE
 }
 
@@ -61,6 +65,17 @@ parse_args() {
         [[ $# -eq 0 ]] && { err "--alpine-image requires an image"; exit 1; }
         ALPINE_IMAGE="$1"
         ;;
+      --service-name)
+        shift
+        [[ $# -eq 0 ]] && { err "--service-name requires a unit name"; exit 1; }
+        SERVICE_NAME="$1"
+        ;;
+      --plex-data-dir)
+        shift
+        [[ $# -eq 0 ]] && { err "--plex-data-dir requires a path"; exit 1; }
+        PLEX_DATA_DIR="$1"
+        ENV_ONLY=1
+        ;;
       --keep-temp)
         KEEP_TEMP=1
         ;;
@@ -83,6 +98,63 @@ require_root() {
     err "Run as root (use sudo)."
     exit 1
   fi
+}
+
+resolve_plex_paths() {
+  PLEX_CACHE_DIR="$PLEX_DATA_DIR/Cache"
+  PLEX_VA_CACHE="$PLEX_CACHE_DIR/va-dri-linux-x86_64"
+  MESA_SHADER_CACHE_DIR="$PLEX_CACHE_DIR/mesa-shader-cache"
+  PLEX_DRIVERS_ROOT="$PLEX_DATA_DIR/Drivers"
+}
+
+resolve_plex_data_dir_from_systemd() {
+  if [[ "$ENV_ONLY" -eq 1 ]]; then
+    log "Using explicit --plex-data-dir override: $PLEX_DATA_DIR"
+    resolve_plex_paths
+    return
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl unavailable; using default Plex data dir: $PLEX_DATA_DIR"
+    resolve_plex_paths
+    return
+  fi
+
+  local unit_env
+  unit_env=$(systemctl show "$SERVICE_NAME" --property=Environment --value 2>/dev/null || true)
+  if [[ -n "$unit_env" ]]; then
+    while IFS= read -r token; do
+      [[ "$token" =~ ^PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR= ]] || continue
+      PLEX_DATA_DIR="${token#PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR=}"
+      PLEX_DATA_DIR="${PLEX_DATA_DIR%\"}"
+      PLEX_DATA_DIR="${PLEX_DATA_DIR#\"}"
+      log "Detected Plex data dir from systemd environment: $PLEX_DATA_DIR"
+      resolve_plex_paths
+      return
+    done < <(printf '%s\n' "$unit_env" | tr ' ' '\n')
+  fi
+
+  local env_files
+  env_files=$(systemctl show "$SERVICE_NAME" --property=EnvironmentFiles --value 2>/dev/null || true)
+  if [[ -n "$env_files" ]]; then
+    local env_file
+    while IFS= read -r env_file; do
+      env_file="${env_file#-}"
+      env_file="${env_file%:*}"
+      [[ -f "$env_file" ]] || continue
+      local parsed
+      parsed=$(awk -F= '/^[[:space:]]*PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR[[:space:]]*=/{sub(/^[^=]*=/,""); gsub(/^"|"$/,""); print; exit}' "$env_file")
+      if [[ -n "$parsed" ]]; then
+        PLEX_DATA_DIR="$parsed"
+        log "Detected Plex data dir from environment file ($env_file): $PLEX_DATA_DIR"
+        resolve_plex_paths
+        return
+      fi
+    done < <(printf '%s\n' "$env_files" | tr ' ' '\n')
+  fi
+
+  log "No systemd override found for Plex data dir; using default: $PLEX_DATA_DIR"
+  resolve_plex_paths
 }
 
 check_plex_paths() {
@@ -226,6 +298,36 @@ link_hardcoded_amdgpu_ids() {
   done <<< "$found"
 }
 
+install_driver_into_plex_drivers() {
+  local temp_dir="$1"
+  local src_driver="$temp_dir/vaapi-amdgpu/lib/dri/radeonsi_drv_video.so"
+
+  if [[ ! -f "$src_driver" ]]; then
+    err "Missing extracted driver: $src_driver"
+    exit 1
+  fi
+
+  run "mkdir -p \"$PLEX_DRIVERS_ROOT\""
+
+  local -a targets=()
+  local existing
+  while IFS= read -r existing; do
+    [[ -n "$existing" ]] && targets+=("$existing")
+  done < <(find "$PLEX_DRIVERS_ROOT" -type f -name 'radeonsi_drv_video.so' 2>/dev/null || true)
+
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    targets+=("$PLEX_DRIVERS_ROOT/lib/dri/radeonsi_drv_video.so")
+    run "mkdir -p \"$PLEX_DRIVERS_ROOT/lib/dri\""
+  fi
+
+  local dst
+  for dst in "${targets[@]}"; do
+    log "Installing driver into Plex Drivers tree: $dst"
+    run "mkdir -p \"$(dirname "$dst")\""
+    backup_then_copy "$src_driver" "$dst"
+  done
+}
+
 setup_plex_va_cache() {
   log "Linking Plex VA cache to Plex-installed DRI drivers..."
   run "mkdir -p \"$PLEX_VA_CACHE\" \"$MESA_SHADER_CACHE_DIR\""
@@ -236,6 +338,12 @@ setup_plex_va_cache() {
     [[ -f "$driver" ]] || continue
     run "ln -sf \"$driver\" \"$PLEX_VA_CACHE/$(basename "$driver")\""
     log "Linked driver: $(basename "$driver")"
+  done
+
+  for driver in "$PLEX_DRIVERS_ROOT"/*/dri/*.so "$PLEX_DRIVERS_ROOT"/dri/*.so; do
+    [[ -f "$driver" ]] || continue
+    run "ln -sf \"$driver\" \"$PLEX_VA_CACHE/$(basename "$driver")\""
+    log "Linked driver from Drivers tree: $(basename "$driver")"
   done
 }
 
@@ -263,11 +371,17 @@ print_next_steps() {
 
 Installation complete.
 
+Resolved paths:
+  Plex data dir: $PLEX_DATA_DIR
+  Plex Drivers:  $PLEX_DRIVERS_ROOT
+
 Recommended checks:
   1. Verify Alpine libs are in Plex lib dir:
        ls "$PLEX_LIB_DIR"/libva*.so* 2>/dev/null || true
        ls "$PLEX_LIB_DIR/dri" | head
-  2. Start a Plex transcode and inspect logs for:
+  2. Verify driver in Plex Drivers tree:
+       find "$PLEX_DRIVERS_ROOT" -name radeonsi_drv_video.so
+  3. Start a Plex transcode and inspect logs for:
        final decoder: vaapi, final encoder: vaapi
 
 If Plex updates replace libraries, rerun this installer.
@@ -278,6 +392,7 @@ OUT
 main() {
   parse_args "$@"
   require_root
+  resolve_plex_data_dir_from_systemd
   check_plex_paths
 
   local temp_dir
@@ -293,6 +408,7 @@ main() {
   overwrite_plex_libraries "$temp_dir"
   install_amdgpu_ids "$temp_dir"
   link_hardcoded_amdgpu_ids
+  install_driver_into_plex_drivers "$temp_dir"
   setup_plex_va_cache
   restart_plex
   print_next_steps
