@@ -123,15 +123,25 @@ resolve_plex_data_dir_from_systemd() {
   local unit_env
   unit_env=$(systemctl show "$SERVICE_NAME" --property=Environment --value 2>/dev/null || true)
   if [[ -n "$unit_env" ]]; then
-    while IFS= read -r token; do
-      [[ "$token" =~ ^PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR= ]] || continue
-      PLEX_DATA_DIR="${token#PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR=}"
-      PLEX_DATA_DIR="${PLEX_DATA_DIR%\"}"
-      PLEX_DATA_DIR="${PLEX_DATA_DIR#\"}"
+    # Environment output can contain shell-quoted assignments when values
+    # include spaces, e.g.:
+    # "PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR=/path/with spaces" FOO=bar
+    # Use shlex-aware tokenization instead of splitting on plain spaces.
+    local parsed
+    parsed=$(python3 - << 'PY' "$unit_env"
+import shlex, sys
+for token in shlex.split(sys.argv[1]):
+    if token.startswith("PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR="):
+        print(token.split("=", 1)[1])
+        break
+PY
+)
+    if [[ -n "$parsed" ]]; then
+      PLEX_DATA_DIR="$parsed"
       log "Detected Plex data dir from systemd environment: $PLEX_DATA_DIR"
       resolve_plex_paths
       return
-    done < <(printf '%s\n' "$unit_env" | tr ' ' '\n')
+    fi
   fi
 
   local env_files
