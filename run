@@ -18,6 +18,17 @@ podman run --rm -v /:/host agreenbhm/alpine_amd:latest sh -c 'cp -R /source/* /h
 echo
 echo "**** Setting up AMD VAAPI drivers ****"
 
+is_shell_script() {
+    local file_path="$1"
+
+    if [ ! -f "$file_path" ]; then
+        return 1
+    fi
+
+    # Treat shebang-based scripts as already wrapped/fixed.
+    head -n 1 "$file_path" | grep -q '^#!'
+}
+
 # ============================================================
 # Step 0: Fix Plex's hardcoded amdgpu.ids path(s)
 # Plex's bundled libdrm has hardcoded paths from their build env.
@@ -59,11 +70,13 @@ fi
 PLEX_TRANSCODER="/usr/lib/plexmediaserver/Plex Transcoder"
 PLEX_TRANSCODER_ORIG="/usr/lib/plexmediaserver/Plex Transcoder.orig"
 
-if [ ! -f "$PLEX_TRANSCODER_ORIG" ]; then
-    echo "Creating Plex Transcoder wrapper..."
-    
-    mv "$PLEX_TRANSCODER" "$PLEX_TRANSCODER_ORIG"
-    
+if is_shell_script "$PLEX_TRANSCODER"; then
+    echo "Plex Transcoder is already a shell script; assuming wrapper is already in place"
+else
+    echo "Plex Transcoder is not a shell script; creating wrapper..."
+
+    mv -f "$PLEX_TRANSCODER" "$PLEX_TRANSCODER_ORIG"
+
     cat > "$PLEX_TRANSCODER" << 'EOF'
 #!/bin/bash
 # AMD VAAPI wrapper - ensures modern Mesa/libva is used
@@ -77,11 +90,9 @@ mkdir -p "$MESA_SHADER_CACHE_DIR" 2>/dev/null
 
 exec "/usr/lib/plexmediaserver/Plex Transcoder.orig" "$@"
 EOF
-    
+
     chmod +x "$PLEX_TRANSCODER"
     echo "Transcoder wrapper created"
-else
-    echo "Transcoder wrapper already exists"
 fi
 
 # ============================================================
@@ -92,16 +103,15 @@ fi
 PLEX_SERVER="/usr/lib/plexmediaserver/Plex Media Server"
 PLEX_SERVER_ORIG="/usr/lib/plexmediaserver/Plex Media Server.orig"
 
-if [ ! -f "$PLEX_SERVER_ORIG" ]; then
-    echo "Creating Plex Media Server wrapper..."
-    
-    mv "$PLEX_SERVER" "$PLEX_SERVER_ORIG"
-    
+if is_shell_script "$PLEX_SERVER"; then
+    echo "Plex Media Server is already a shell script; assuming wrapper is already in place"
+else
+    echo "Plex Media Server is not a shell script; creating wrapper..."
+
+    mv -f "$PLEX_SERVER" "$PLEX_SERVER_ORIG"
+
     cat > "$PLEX_SERVER" << 'EOF'
 #!/bin/bash
-
-# Re-run Radeon driver fix on each launch
-__REPLACE_WITH_SCRIPT__
 
 # AMD VAAPI wrapper for main Plex process
 export LD_LIBRARY_PATH="/vaapi-amdgpu/lib:${LD_LIBRARY_PATH}"
@@ -114,11 +124,9 @@ mkdir -p "$MESA_SHADER_CACHE_DIR" 2>/dev/null
 
 exec "/usr/lib/plexmediaserver/Plex Media Server.orig" "$@"
 EOF
-    
+
     chmod +x "$PLEX_SERVER"
     echo "Plex Media Server wrapper created"
-else
-    echo "Plex Media Server wrapper already exists"
 fi
 
 # ============================================================
@@ -144,11 +152,5 @@ done
 if [ -f "$OUR_AMDGPU_IDS" ]; then
     echo "amdgpu.ids present at $OUR_AMDGPU_IDS"
 fi
-
-#
-# Step 5: Make script auto-run on Plex start
-#
-
-sed -i "s|__REPLACE_WITH_SCRIPT__|$SCRIPT_PATH/run|g" "/usr/lib/plexmediaserver/Plex Media Server"
 
 echo "**** AMD VAAPI setup complete ****"
