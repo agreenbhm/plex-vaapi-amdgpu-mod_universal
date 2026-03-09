@@ -9,7 +9,8 @@ set -euo pipefail
 
 PLEX_DIR="/usr/lib/plexmediaserver"
 PLEX_LIB_DIR="$PLEX_DIR/lib"
-PLEX_DATA_DIR="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server"
+PLEX_APP_SUPPORT_DIR="/var/lib/plexmediaserver/Library/Application Support"
+PLEX_DATA_DIR=""
 PLEX_CACHE_DIR=""
 PLEX_VA_CACHE=""
 MESA_SHADER_CACHE_DIR=""
@@ -37,7 +38,7 @@ Options:
   --no-restart            Do not restart plexmediaserver
   --alpine-image IMG      Override source image (default: alpine:edge)
   --service-name NAME     Override systemd unit name (default: plexmediaserver)
-  --plex-data-dir PATH    Override Plex app support dir (skip systemd env detection)
+  --plex-data-dir PATH    Override Plex app-support path (root or full ".../Plex Media Server")
   --keep-temp             Keep temporary extraction directory
   -h, --help              Show this help
 USAGE
@@ -73,7 +74,7 @@ parse_args() {
       --plex-data-dir)
         shift
         [[ $# -eq 0 ]] && { err "--plex-data-dir requires a path"; exit 1; }
-        PLEX_DATA_DIR="$1"
+        PLEX_APP_SUPPORT_DIR="$1"
         ENV_ONLY=1
         ;;
       --keep-temp)
@@ -100,7 +101,15 @@ require_root() {
   fi
 }
 
-resolve_plex_paths() {
+normalize_plex_paths() {
+  # Accept either app-support root or full ".../Plex Media Server" path.
+  if [[ "$PLEX_APP_SUPPORT_DIR" == */"Plex Media Server" ]]; then
+    PLEX_DATA_DIR="$PLEX_APP_SUPPORT_DIR"
+    PLEX_APP_SUPPORT_DIR="${PLEX_APP_SUPPORT_DIR%/Plex Media Server}"
+  else
+    PLEX_DATA_DIR="$PLEX_APP_SUPPORT_DIR/Plex Media Server"
+  fi
+
   PLEX_CACHE_DIR="$PLEX_DATA_DIR/Cache"
   PLEX_VA_CACHE="$PLEX_CACHE_DIR/va-dri-linux-x86_64"
   MESA_SHADER_CACHE_DIR="$PLEX_CACHE_DIR/mesa-shader-cache"
@@ -109,14 +118,14 @@ resolve_plex_paths() {
 
 resolve_plex_data_dir_from_systemd() {
   if [[ "$ENV_ONLY" -eq 1 ]]; then
-    log "Using explicit --plex-data-dir override: $PLEX_DATA_DIR"
-    resolve_plex_paths
+    log "Using explicit --plex-data-dir override: $PLEX_APP_SUPPORT_DIR"
+    normalize_plex_paths
     return
   fi
 
   if ! command -v systemctl >/dev/null 2>&1; then
-    warn "systemctl unavailable; using default Plex data dir: $PLEX_DATA_DIR"
-    resolve_plex_paths
+    warn "systemctl unavailable; using default Plex app-support dir: $PLEX_APP_SUPPORT_DIR"
+    normalize_plex_paths
     return
   fi
 
@@ -137,9 +146,9 @@ for token in shlex.split(sys.argv[1]):
 PY
 )
     if [[ -n "$parsed" ]]; then
-      PLEX_DATA_DIR="$parsed"
-      log "Detected Plex data dir from systemd environment: $PLEX_DATA_DIR"
-      resolve_plex_paths
+      PLEX_APP_SUPPORT_DIR="$parsed"
+      log "Detected Plex app-support dir from systemd environment: $PLEX_APP_SUPPORT_DIR"
+      normalize_plex_paths
       return
     fi
   fi
@@ -155,16 +164,16 @@ PY
       local parsed
       parsed=$(awk -F= '/^[[:space:]]*PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR[[:space:]]*=/{sub(/^[^=]*=/,""); gsub(/^"|"$/,""); print; exit}' "$env_file")
       if [[ -n "$parsed" ]]; then
-        PLEX_DATA_DIR="$parsed"
-        log "Detected Plex data dir from environment file ($env_file): $PLEX_DATA_DIR"
-        resolve_plex_paths
+        PLEX_APP_SUPPORT_DIR="$parsed"
+        log "Detected Plex app-support dir from environment file ($env_file): $PLEX_APP_SUPPORT_DIR"
+        normalize_plex_paths
         return
       fi
     done < <(printf '%s\n' "$env_files" | tr ' ' '\n')
   fi
 
-  log "No systemd override found for Plex data dir; using default: $PLEX_DATA_DIR"
-  resolve_plex_paths
+  log "No systemd override found for Plex app-support dir; using default: $PLEX_APP_SUPPORT_DIR"
+  normalize_plex_paths
 }
 
 check_plex_paths() {
@@ -382,7 +391,8 @@ print_next_steps() {
 Installation complete.
 
 Resolved paths:
-  Plex data dir: $PLEX_DATA_DIR
+  Plex app-support dir: $PLEX_APP_SUPPORT_DIR
+  Plex data dir:        $PLEX_DATA_DIR
   Plex Drivers:  $PLEX_DRIVERS_ROOT
 
 Recommended checks:

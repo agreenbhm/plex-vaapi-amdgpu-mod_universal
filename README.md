@@ -6,7 +6,7 @@ This repository provides a host-side installer that **replaces Plex-used librari
 
 `install-plex-amd-vaapi.sh` performs these steps:
 
-1. Detects Plex environment overrides from systemd (`Environment=` and `EnvironmentFile=`), including `PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR`, unless you explicitly set `--plex-data-dir`.
+1. Detects Plex environment overrides from systemd (`Environment=` and `EnvironmentFile=`), including `PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR` (treated as app-support root, with `Plex Media Server` appended), unless you explicitly set `--plex-data-dir`.
 2. Pulls Alpine (`alpine:edge` by default) via `docker` or `podman`.
 3. Extracts MUSL VAAPI stack components:
    - `radeonsi_drv_video.so`
@@ -49,7 +49,7 @@ sudo ./install-plex-amd-vaapi.sh
 --no-restart            Do not restart plexmediaserver
 --alpine-image IMG      Override source image (default: alpine:edge)
 --service-name NAME     Override systemd unit name (default: plexmediaserver)
---plex-data-dir PATH    Override Plex app support dir (skip systemd env detection)
+--plex-data-dir PATH    Override Plex app-support path (root or full ".../Plex Media Server")
 --keep-temp             Keep temporary extraction directory
 ```
 
