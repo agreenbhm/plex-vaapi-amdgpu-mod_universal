@@ -9,14 +9,6 @@ if [ -z "$PLEX_APPLICATION_SUPPORT_DIR" ]; then
         export PLEX_APPLICATION_SUPPORT_DIR="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server"
 fi
 
-echo "**** Building Alpine container with MUSL dependencies ****"
-podman build -t agreenbhm/alpine_amd:latest -f "$SCRIPT_PATH/Dockerfile"
-echo
-echo "**** Copying AMD VAAPI drivers and MUSL dependencies from Alpine image to host ****"
-podman run --rm -v /:/host agreenbhm/alpine_amd:latest sh -c 'cp -R /source/* /host/'
-echo
-echo "**** Setting up AMD VAAPI drivers ****"
-
 is_shell_script() {
     local file_path="$1"
 
@@ -29,30 +21,53 @@ is_shell_script() {
 }
 
 # ============================================================
-# Step 0: Fix Plex's hardcoded amdgpu.ids path(s)
+# Detect AMD GPU
 # ============================================================
+IS_AMD_GPU=0
+if grep -iq "0x1002" /sys/class/drm/card*/device/vendor 2>/dev/null; then
+    IS_AMD_GPU=1
+elif command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -iE 'vga|3d|display' | grep -iqE 'amd|radeon'; then
+    IS_AMD_GPU=1
+fi
 
-OUR_AMDGPU_IDS="/usr/share/libdrm/amdgpu.ids"
+if [ "$IS_AMD_GPU" -eq 1 ]; then
+    echo "**** AMD GPU detected ****"
 
-if [ -f "$OUR_AMDGPU_IDS" ]; then
-    echo "Scanning for hardcoded amdgpu.ids paths..."
-    FOUND_PATHS=$(grep -r -h -o -a '/home/runner[^"]*amdgpu\.ids' \
-                  /usr/lib/plexmediaserver/lib/ 2>/dev/null | sort -u)
+    echo "**** Building Alpine container with MUSL dependencies ****"
+    podman build -t agreenbhm/alpine_amd:latest -f "$SCRIPT_PATH/Dockerfile"
+    echo
+    echo "**** Copying AMD VAAPI drivers and MUSL dependencies from Alpine image to host ****"
+    podman run --rm -v /:/host agreenbhm/alpine_amd:latest sh -c 'cp -R /source/* /host/'
+    echo
+    echo "**** Setting up AMD VAAPI drivers ****"
 
-    if [ -n "$FOUND_PATHS" ]; then
-        echo "$FOUND_PATHS" | while read -r ids_path; do
-            if [ -n "$ids_path" ]; then
-                echo "Found hardcoded path: $ids_path"
-                mkdir -p "$(dirname "$ids_path")"
-                ln -sf "$OUR_AMDGPU_IDS" "$ids_path"
-                echo "  -> Symlinked"
-            fi
-        done
+    # ============================================================
+    # Step 0: Fix Plex's hardcoded amdgpu.ids path(s)
+    # ============================================================
+    OUR_AMDGPU_IDS="/usr/share/libdrm/amdgpu.ids"
+
+    if [ -f "$OUR_AMDGPU_IDS" ]; then
+        echo "Scanning for hardcoded amdgpu.ids paths..."
+        FOUND_PATHS=$(grep -r -h -o -a '/home/runner[^"]*amdgpu\.ids' \
+                      /usr/lib/plexmediaserver/lib/ 2>/dev/null | sort -u)
+
+        if [ -n "$FOUND_PATHS" ]; then
+            echo "$FOUND_PATHS" | while read -r ids_path; do
+                if [ -n "$ids_path" ]; then
+                    echo "Found hardcoded path: $ids_path"
+                    mkdir -p "$(dirname "$ids_path")"
+                    ln -sf "$OUR_AMDGPU_IDS" "$ids_path"
+                    echo "  -> Symlinked"
+                fi
+            done
+        else
+            echo "No hardcoded paths found (GPU may show as 'Unknown AMD' - cosmetic only)"
+        fi
     else
-        echo "No hardcoded paths found (GPU may show as 'Unknown AMD' - cosmetic only)"
+        echo "WARNING: amdgpu.ids not found at $OUR_AMDGPU_IDS"
     fi
 else
-    echo "WARNING: amdgpu.ids not found at $OUR_AMDGPU_IDS"
+    echo "**** No AMD GPU detected. Using generic wrappers. ****"
 fi
 
 # ============================================================
@@ -67,9 +82,10 @@ if is_shell_script "$PLEX_TRANSCODER"; then
 else
     echo "Plex Transcoder is not a shell script; creating wrapper..."
 
-    mv -f "$PLEX_TRANSCODER" "$PLEX_TRANSCODER_ORIG"
+    mv -f "$PLEX_TRANSCODER" "$PLEX_TRANSCODER_ORIG" 2>/dev/null || true
 
-    cat > "$PLEX_TRANSCODER" << 'EOF'
+    if [ "$IS_AMD_GPU" -eq 1 ]; then
+        cat > "$PLEX_TRANSCODER" << 'INNER_EOF'
 #!/bin/bash
 export LD_LIBRARY_PATH="/vaapi-amdgpu/lib:${LD_LIBRARY_PATH}"
 export LIBVA_DRIVERS_PATH="/vaapi-amdgpu/lib/dri"
@@ -116,9 +132,15 @@ else
     # No subtitles detected, pass original arguments unmodified
     exec "/usr/lib/plexmediaserver/Plex Transcoder.orig" "$@"
 fi
-EOF
+INNER_EOF
+    else
+        cat > "$PLEX_TRANSCODER" << 'INNER_EOF'
+#!/bin/bash
+exec "/usr/lib/plexmediaserver/Plex Transcoder.orig" "$@"
+INNER_EOF
+    fi
 
-    chmod +x "$PLEX_TRANSCODER"
+    chmod +x "$PLEX_TRANSCODER" 2>/dev/null || true
     echo "Transcoder wrapper created"
 fi
 
@@ -134,9 +156,10 @@ if is_shell_script "$PLEX_SERVER"; then
 else
     echo "Plex Media Server is not a shell script; creating wrapper..."
 
-    mv -f "$PLEX_SERVER" "$PLEX_SERVER_ORIG"
+    mv -f "$PLEX_SERVER" "$PLEX_SERVER_ORIG" 2>/dev/null || true
 
-    cat > "$PLEX_SERVER" << 'EOF'
+    if [ "$IS_AMD_GPU" -eq 1 ]; then
+        cat > "$PLEX_SERVER" << 'INNER_EOF'
 #!/bin/bash
 export LD_LIBRARY_PATH="/vaapi-amdgpu/lib:${LD_LIBRARY_PATH}"
 export LIBVA_DRIVERS_PATH="/vaapi-amdgpu/lib/dri"
@@ -145,9 +168,15 @@ export MESA_SHADER_CACHE_DIR="${PLEX_APPLICATION_SUPPORT_DIR}/Plex Media Server/
 mkdir -p "$MESA_SHADER_CACHE_DIR" 2>/dev/null
 
 exec "/usr/lib/plexmediaserver/Plex Media Server.orig" "$@"
-EOF
+INNER_EOF
+    else
+        cat > "$PLEX_SERVER" << 'INNER_EOF'
+#!/bin/bash
+exec "/usr/lib/plexmediaserver/Plex Media Server.orig" "$@"
+INNER_EOF
+    fi
 
-    chmod +x "$PLEX_SERVER"
+    chmod +x "$PLEX_SERVER" 2>/dev/null || true
     echo "Plex Media Server wrapper created"
 fi
 
@@ -155,23 +184,26 @@ fi
 # Step 3: Set up symlinks in Plex's VA driver cache
 # ============================================================
 
-PLEX_VA_CACHE="${PLEX_APPLICATION_SUPPORT_DIR}/Plex Media Server/Cache/va-dri-linux-x86_64"
-mkdir -p "$PLEX_VA_CACHE"
-rm -f "$PLEX_VA_CACHE"/*.so* 2>/dev/null
+if [ "$IS_AMD_GPU" -eq 1 ]; then
+    PLEX_VA_CACHE="${PLEX_APPLICATION_SUPPORT_DIR}/Plex Media Server/Cache/va-dri-linux-x86_64"
+    mkdir -p "$PLEX_VA_CACHE"
+    rm -f "$PLEX_VA_CACHE"/*.so* 2>/dev/null
 
-for driver in /vaapi-amdgpu/lib/dri/*.so; do
-    if [ -f "$driver" ]; then
-        ln -sf "$driver" "$PLEX_VA_CACHE/$(basename "$driver")"
-        echo "Linked driver: $(basename "$driver")"
+    for driver in /vaapi-amdgpu/lib/dri/*.so; do
+        if [ -f "$driver" ]; then
+            ln -sf "$driver" "$PLEX_VA_CACHE/$(basename "$driver")"
+            echo "Linked driver: $(basename "$driver")"
+        fi
+    done
+
+    # ============================================================
+    # Step 4: Verify setup
+    # ============================================================
+
+    if [ -f "$OUR_AMDGPU_IDS" ]; then
+        echo "amdgpu.ids present at $OUR_AMDGPU_IDS"
     fi
-done
-
-# ============================================================
-# Step 4: Verify setup
-# ============================================================
-
-if [ -f "$OUR_AMDGPU_IDS" ]; then
-    echo "amdgpu.ids present at $OUR_AMDGPU_IDS"
+    echo "**** AMD VAAPI setup complete ****"
+else
+    echo "**** Non-AMD setup complete ****"
 fi
-echo "**** AMD VAAPI setup complete ****"
-
