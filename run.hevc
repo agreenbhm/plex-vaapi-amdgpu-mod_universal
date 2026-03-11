@@ -77,12 +77,19 @@ fi
 PLEX_TRANSCODER="/usr/lib/plexmediaserver/Plex Transcoder"
 PLEX_TRANSCODER_ORIG="/usr/lib/plexmediaserver/Plex Transcoder.orig"
 
-if is_shell_script "$PLEX_TRANSCODER"; then
-    echo "Plex Transcoder is already a shell script; assuming wrapper is already in place"
+if is_shell_script "$PLEX_TRANSCODER" && [ "$IS_AMD_GPU" -eq 1 ]; then
+    echo "Plex Transcoder is already a shell script; rebuilding wrapper to ensure platform correctness..."
 else
     echo "Plex Transcoder is not a shell script; creating wrapper..."
 
-    mv -f "$PLEX_TRANSCODER" "$PLEX_TRANSCODER_ORIG" 2>/dev/null || true
+    # Only move the binary if we are wrapping it for the first time
+    if [ ! -f "$PLEX_TRANSCODER_ORIG" ]; then
+        mv -f "$PLEX_TRANSCODER" "$PLEX_TRANSCODER_ORIG" 2>/dev/null || true
+    fi
+fi
+
+# Always recreate the wrapper
+if true; then
 
     if [ "$IS_AMD_GPU" -eq 1 ]; then
         cat > "$PLEX_TRANSCODER" << 'INNER_EOF'
@@ -151,12 +158,19 @@ fi
 PLEX_SERVER="/usr/lib/plexmediaserver/Plex Media Server"
 PLEX_SERVER_ORIG="/usr/lib/plexmediaserver/Plex Media Server.orig"
 
-if is_shell_script "$PLEX_SERVER"; then
-    echo "Plex Media Server is already a shell script; assuming wrapper is already in place"
+if is_shell_script "$PLEX_SERVER" && [ "$IS_AMD_GPU" -eq 1 ]; then
+    echo "Plex Media Server is already a shell script; rebuilding wrapper to ensure platform correctness..."
 else
     echo "Plex Media Server is not a shell script; creating wrapper..."
 
-    mv -f "$PLEX_SERVER" "$PLEX_SERVER_ORIG" 2>/dev/null || true
+    # Only move the binary if we are wrapping it for the first time
+    if [ ! -f "$PLEX_SERVER_ORIG" ]; then
+        mv -f "$PLEX_SERVER" "$PLEX_SERVER_ORIG" 2>/dev/null || true
+    fi
+fi
+
+# Always recreate the wrapper
+if true; then
 
     if [ "$IS_AMD_GPU" -eq 1 ]; then
         cat > "$PLEX_SERVER" << 'INNER_EOF'
