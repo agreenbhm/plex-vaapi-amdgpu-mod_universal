@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+
+SCRIPT_PATH="$(dirname $(realpath $0))"                     
+if [ -f .env ]; then
+        source "$SCRIPT_PATH/.env"
+fi
+
+if [ -z "$PLEX_APPLICATION_SUPPORT_DIR" ]; then
+        export PLEX_APPLICATION_SUPPORT_DIR="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server"
+fi
+
+echo "**** Building Alpine container with MUSL dependencies ****"
+podman build -t agreenbhm/alpine_amd:latest -f "$SCRIPT_PATH/Dockerfile"
+echo
+echo "**** Copying AMD VAAPI drivers and MUSL dependencies from Alpine image to host ****"
+podman run --rm -v /:/host agreenbhm/alpine_amd:latest sh -c 'cp -R /source/* /host/'
+echo
+echo "**** Setting up AMD VAAPI drivers ****"
+
+is_shell_script() {
+    local file_path="$1"
+
+    if [ ! -f "$file_path" ]; then
+        return 1
+    fi
+
+    # Treat shebang-based scripts as already wrapped/fixed.
+    head -n 1 "$file_path" | grep -q '^#!'
+}
+
+# ============================================================
+# Step 0: Fix Plex's hardcoded amdgpu.ids path(s)
+# ============================================================
+
+OUR_AMDGPU_IDS="/usr/share/libdrm/amdgpu.ids"
+
+if [ -f "$OUR_AMDGPU_IDS" ]; then
+    echo "Scanning for hardcoded amdgpu.ids paths..."
+    FOUND_PATHS=$(grep -r -h -o -a '/home/runner[^"]*amdgpu\.ids' \
+                  /usr/lib/plexmediaserver/lib/ 2>/dev/null | sort -u)
+
+    if [ -n "$FOUND_PATHS" ]; then
+        echo "$FOUND_PATHS" | while read -r ids_path; do
+            if [ -n "$ids_path" ]; then
+                echo "Found hardcoded path: $ids_path"
+                mkdir -p "$(dirname "$ids_path")"
+                ln -sf "$OUR_AMDGPU_IDS" "$ids_path"
+                echo "  -> Symlinked"
+            fi
+        done
+    else
+        echo "No hardcoded paths found (GPU may show as 'Unknown AMD' - cosmetic only)"
+    fi
+else
+    echo "WARNING: amdgpu.ids not found at $OUR_AMDGPU_IDS"
+fi
+
+# ============================================================
+# Step 1: Create wrapper for Plex Transcoder
+# ============================================================
+
+PLEX_TRANSCODER="/usr/lib/plexmediaserver/Plex Transcoder"
+PLEX_TRANSCODER_ORIG="/usr/lib/plexmediaserver/Plex Transcoder.orig"
+
+if is_shell_script "$PLEX_TRANSCODER"; then
+    echo "Plex Transcoder is already a shell script; assuming wrapper is already in place"
+else
+    echo "Plex Transcoder is not a shell script; creating wrapper..."
+
+    mv -f "$PLEX_TRANSCODER" "$PLEX_TRANSCODER_ORIG"
+
+    cat > "$PLEX_TRANSCODER" << 'EOF'
+#!/bin/bash
+export LD_LIBRARY_PATH="/vaapi-amdgpu/lib:${LD_LIBRARY_PATH}"
+export LIBVA_DRIVERS_PATH="/vaapi-amdgpu/lib/dri"
+export LIBVA_DRIVER_NAME="radeonsi"
+export MESA_SHADER_CACHE_DIR="$PLEX_APPLICATION_SUPPORT_DIR/Plex Media Server/Cache/mesa-shader-cache"
+mkdir -p "$MESA_SHADER_CACHE_DIR" 2>/dev/null
+
+# Pre-scan arguments to see if subtitles are being burned in
+burn_subtitles=0
+for arg in "$@"; do
+    if [[ "$arg" == *"inlineass"* ]] || [[ "$arg" == *"subtitles="* ]]; then
+        burn_subtitles=1
+        break
+    fi
+done
+
+if [[ $burn_subtitles -eq 1 ]]; then
+    new_args=()
+    skip_next=0
+
+    for arg in "$@"; do
+        if (( skip_next > 0 )); then
+            skip_next=$((skip_next - 1))
+            continue
+        fi
+
+        case "$arg" in
+            h264_vaapi)
+                # Swap to HEVC and force Constant Quality (QP 18)
+                #new_args+=("hevc_vaapi" "-rc_mode" "1" "-qp" "18")
+                new_args+=("hevc_vaapi" "-rc_mode" "1" "-qp" "16" "-compression_level" "1" "-bf" "3")
+                ;;
+            -b:0|-maxrate:0|-bufsize:0)
+                # Strip Plex's rigid bitrate constraints
+                skip_next=1
+                ;;
+            *)
+                new_args+=("$arg")
+                ;;
+        esac
+    done
+    exec "/usr/lib/plexmediaserver/Plex Transcoder.orig" "${new_args[@]}"
+else
+    # No subtitles detected, pass original arguments unmodified
+    exec "/usr/lib/plexmediaserver/Plex Transcoder.orig" "$@"
+fi
+EOF
+
+    chmod +x "$PLEX_TRANSCODER"
+    echo "Transcoder wrapper created"
+fi
+
+# ============================================================
+# Step 2: Create wrapper for Plex Media Server
+# ============================================================
+
+PLEX_SERVER="/usr/lib/plexmediaserver/Plex Media Server"
+PLEX_SERVER_ORIG="/usr/lib/plexmediaserver/Plex Media Server.orig"
+
+if is_shell_script "$PLEX_SERVER"; then
+    echo "Plex Media Server is already a shell script; assuming wrapper is already in place"
+else
+    echo "Plex Media Server is not a shell script; creating wrapper..."
+
+    mv -f "$PLEX_SERVER" "$PLEX_SERVER_ORIG"
+
+    cat > "$PLEX_SERVER" << 'EOF'
+#!/bin/bash
+export LD_LIBRARY_PATH="/vaapi-amdgpu/lib:${LD_LIBRARY_PATH}"
+export LIBVA_DRIVERS_PATH="/vaapi-amdgpu/lib/dri"
+export LIBVA_DRIVER_NAME="radeonsi"
+export MESA_SHADER_CACHE_DIR="${PLEX_APPLICATION_SUPPORT_DIR}/Plex Media Server/Cache/mesa-shader-cache"
+mkdir -p "$MESA_SHADER_CACHE_DIR" 2>/dev/null
+
+exec "/usr/lib/plexmediaserver/Plex Media Server.orig" "$@"
+EOF
+
+    chmod +x "$PLEX_SERVER"
+    echo "Plex Media Server wrapper created"
+fi
+
+# ============================================================
+# Step 3: Set up symlinks in Plex's VA driver cache
+# ============================================================
+
+PLEX_VA_CACHE="${PLEX_APPLICATION_SUPPORT_DIR}/Plex Media Server/Cache/va-dri-linux-x86_64"
+mkdir -p "$PLEX_VA_CACHE"
+rm -f "$PLEX_VA_CACHE"/*.so* 2>/dev/null
+
+for driver in /vaapi-amdgpu/lib/dri/*.so; do
+    if [ -f "$driver" ]; then
+        ln -sf "$driver" "$PLEX_VA_CACHE/$(basename "$driver")"
+        echo "Linked driver: $(basename "$driver")"
+    fi
+done
+
+# ============================================================
+# Step 4: Verify setup
+# ============================================================
+
+if [ -f "$OUR_AMDGPU_IDS" ]; then
+    echo "amdgpu.ids present at $OUR_AMDGPU_IDS"
+fi
+echo "**** AMD VAAPI setup complete ****"
+
