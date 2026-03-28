@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SCRIPT_PATH="$(dirname $(realpath $0))"                     
+SCRIPT_PATH="$(dirname $(realpath $0))"               
 if [ -f .env ]; then
         source "$SCRIPT_PATH/.env"
 fi
@@ -8,7 +8,6 @@ fi
 if [ -z "$PLEX_APPLICATION_SUPPORT_DIR" ]; then
         export PLEX_APPLICATION_SUPPORT_DIR="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server"
 fi
-
 is_shell_script() {
     local file_path="$1"
 
@@ -121,8 +120,6 @@ if [[ $burn_subtitles -eq 1 ]]; then
 
         case "$arg" in
             h264_vaapi)
-                # Swap to HEVC and force Constant Quality (QP 18)
-                #new_args+=("hevc_vaapi" "-rc_mode" "1" "-qp" "18")
                 new_args+=("hevc_vaapi" "-rc_mode" "1" "-qp" "16" "-compression_level" "1" "-bf" "3")
                 ;;
             -b:0|-maxrate:0|-bufsize:0)
@@ -130,7 +127,20 @@ if [[ $burn_subtitles -eq 1 ]]; then
                 skip_next=1
                 ;;
             *)
-                new_args+=("$arg")
+                # Fix HEVC alignment green line: Plex's filter chain burns subs on CPU
+                # then hwuploads back to GPU. HEVC requires 16-byte height alignment;
+                # 1080 % 16 = 8, so the encoder pads the bottom 8 rows green.
+                # Insert crop=iw:trunc(ih/16)*16 before the final hwupload to trim
+                # the unaligned rows on the CPU side before they reach the encoder.
+                if [[ "$arg" == *"inlineass"* ]]; then
+                    fixed="${arg}"
+                    # Target: ;[N]hwupload  (the upload back to GPU after subtitle burn)
+                    # Leave:  [0:0]hwupload (the first upload, no leading semicolon+bracket)
+                    fixed=$(echo "$fixed" | sed 's/;\(\[[0-9]*\]\)hwupload/;\1crop=iw:trunc(ih\/16)*16,hwupload/g')
+                    new_args+=("$fixed")
+                else
+                    new_args+=("$arg")
+                fi
                 ;;
         esac
     done
@@ -159,8 +169,7 @@ PLEX_SERVER="/usr/lib/plexmediaserver/Plex Media Server"
 PLEX_SERVER_ORIG="/usr/lib/plexmediaserver/Plex Media Server.orig"
 
 if is_shell_script "$PLEX_SERVER" && [ "$IS_AMD_GPU" -eq 1 ]; then
-    echo "Plex Media Server is already a shell script; rebuilding wrapper to ensure platform correctness..."
-else
+    echo "Plex Media Server is already a shell script; rebuilding wrapper to ensure platform correctness..."else
     echo "Plex Media Server is not a shell script; creating wrapper..."
 
     # Only move the binary if we are wrapping it for the first time
